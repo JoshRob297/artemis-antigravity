@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 class ModelProvider(StrEnum):
     GOOGLE = "google"
     GEMINI = "google"
+    ANTIGRAVITY = "antigravity"
     VERTEX_AI = "vertexai"
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
@@ -64,6 +65,8 @@ class ModelProvider(StrEnum):
         mapping = {
             "google": cls.GOOGLE,
             "gemini": cls.GOOGLE,
+            "antigravity": cls.ANTIGRAVITY,
+            "cloudcode": cls.ANTIGRAVITY,
             "vertexai": cls.VERTEX_AI,
             "vertex": cls.VERTEX_AI,
             "openai": cls.OPENAI,
@@ -221,7 +224,17 @@ class ModelFactory:
 
         provider = ModelProvider.from_string(endpoint.provider)
 
-        if provider == ModelProvider.GOOGLE:
+        if provider == ModelProvider.ANTIGRAVITY:
+            from artemis.antigravity.model import AntigravityChatModel
+
+            return AntigravityChatModel(
+                model_name=endpoint.model_name,
+                temperature=endpoint.temperature,
+                max_output_tokens=endpoint.max_tokens,
+                timeout=endpoint.timeout_seconds,
+            )
+
+        elif provider == ModelProvider.GOOGLE:
             _patch_langchain_google_genai()
             from langchain_google_genai import (
                 ChatGoogleGenerativeAI,
@@ -235,6 +248,24 @@ class ModelFactory:
                 or os.environ.get("GOOGLE_API_KEY")
                 or os.environ.get("GEMINI_API_KEY")
             )
+
+            # If no API key is provided, fallback transparently to Antigravity OAuth
+            if not api_key:
+                from artemis.antigravity.accounts import get_account_manager
+                from artemis.antigravity.model import AntigravityChatModel
+
+                mgr = get_account_manager()
+                if mgr.get_account_count() > 0:
+                    logger.info(
+                        f"No GEMINI_API_KEY set — automatically using Antigravity OAuth provider ({mgr.get_active_email()})"
+                    )
+                    return AntigravityChatModel(
+                        model_name=endpoint.model_name,
+                        temperature=endpoint.temperature,
+                        max_output_tokens=endpoint.max_tokens,
+                        timeout=endpoint.timeout_seconds,
+                    )
+
             # Gemini 1.x/2.x only understand thinking_budget.
             thinking_level = (
                 endpoint.thinking_level if supports_thinking_level(endpoint.model_name) else None

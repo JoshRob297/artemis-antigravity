@@ -162,6 +162,32 @@ class LLMCredentialsProbe(BaseProbe):
             "api_keys": api_keys_map,
         }
 
+        # Case 0: Antigravity Multi-Account OAuth configured
+        from artemis.antigravity import get_account_manager
+
+        mgr = get_account_manager()
+        if mgr.get_account_count() > 0:
+            active_email = mgr.get_active_email()
+            metadata["antigravity_accounts"] = mgr.get_account_count()
+            metadata["active_account"] = active_email
+            return ProbeResult(
+                id=self.probe_id,
+                category=self.category,
+                title="Multimodal LLM API Key",
+                status=ProbeStatus.PASS,
+                is_blocker=self.is_blocker,
+                summary=f"Active (Antigravity: {mgr.get_account_count()} accounts)",
+                description=f"Antigravity OAuth multi-account engine active ({active_email}, {mgr.get_account_count()} accounts registered with auto-rotation).",
+                metadata=metadata,
+                actions=[
+                    ProbeAction(
+                        action_type="hint",
+                        label="Antigravity Active",
+                        payload=f"Native Antigravity OAuth provider is active with {mgr.get_account_count()} Google Cloud Code accounts.",
+                    )
+                ],
+            )
+
         # Case 1: Gemini API Key configured (Standard / Recommended)
         if gemini_key:
             masked = self._mask_key(gemini_key.get_secret_value())

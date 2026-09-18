@@ -107,6 +107,12 @@ live_screenshot*.png
 !.env.example
 *.pem
 *.key
+*accounts.json
+**/accounts.json
+antigravity-accounts.json
+scratch/
+traces/
+*.log
 
 # OS Artifacts
 .DS_Store

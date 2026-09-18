@@ -86,9 +86,15 @@ class LLM(BaseModel):
         if self.provider == "openai":
             if not settings.OPENAI_API_KEY:
                 raise Exception(f"{name} requires OPENAI_API_KEY in .env")
-        elif self.provider == "google":
+        elif self.provider in ("google", "antigravity"):
             if not settings.GOOGLE_API_KEY:
-                raise Exception(f"{name} requires GOOGLE_API_KEY in .env")
+                # Check if Antigravity OAuth accounts are available
+                from artemis.antigravity import get_account_manager
+
+                if get_account_manager().get_account_count() == 0:
+                    raise Exception(
+                        f"{name} requires GOOGLE_API_KEY in .env or Antigravity accounts configured"
+                    )
         elif self.provider == "vertexai":
             validate_vertex_ai_credentials()
         elif self.provider == "anthropic":
