@@ -57,7 +57,40 @@ def _resolve_backend_model(model_name: str) -> str:
         return "gemini-2.5-flash"
     elif "sonnet" in m:
         return "claude-sonnet-4-6"
+    elif "gpt-oss" in m:
+        return "gpt-oss-120b-medium"
     return "gemini-3.8-flash-low"
+
+
+def _sanitize_tool_parameters(params: dict[str, Any]) -> dict[str, Any]:
+    """Recursively validates and cleans tool JSON schema for Cloud Code/Gemini strict mode."""
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+
+    cleaned = dict(params)
+    props = cleaned.get("properties")
+
+    if isinstance(props, dict):
+        cleaned_props = {}
+        for prop_name, prop_schema in props.items():
+            if isinstance(prop_schema, dict):
+                cleaned_props[prop_name] = _sanitize_tool_parameters(prop_schema)
+            else:
+                cleaned_props[prop_name] = prop_schema
+        cleaned["properties"] = cleaned_props
+
+        req = cleaned.get("required")
+        if isinstance(req, list):
+            valid_req = [r for r in req if isinstance(r, str) and r in cleaned_props]
+            if valid_req:
+                cleaned["required"] = valid_req
+            else:
+                cleaned.pop("required", None)
+    else:
+        cleaned["properties"] = {}
+        cleaned.pop("required", None)
+
+    return cleaned
 
 
 def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str, Any]]:
@@ -71,10 +104,15 @@ def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str
         declarations = []
         for gt in genai_tools:
             d = gt.model_dump(mode="json", exclude_none=True)
-            if "function_declarations" in d:
-                declarations.append({"functionDeclarations": d["function_declarations"]})
-            elif "functionDeclarations" in d:
-                declarations.append({"functionDeclarations": d["functionDeclarations"]})
+            decls_list = d.get("function_declarations") or d.get("functionDeclarations")
+            if decls_list and isinstance(decls_list, list):
+                sanitized_decls = []
+                for item in decls_list:
+                    decl_item = dict(item)
+                    if "parameters" in decl_item:
+                        decl_item["parameters"] = _sanitize_tool_parameters(decl_item["parameters"])
+                    sanitized_decls.append(decl_item)
+                declarations.append({"functionDeclarations": sanitized_decls})
             else:
                 declarations.append(d)
         return declarations
@@ -96,7 +134,7 @@ def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str
                     {
                         "name": name,
                         "description": desc or "",
-                        "parameters": params or {"type": "object", "properties": {}},
+                        "parameters": _sanitize_tool_parameters(params),
                     }
                 )
         return [{"functionDeclarations": fn_decls}] if fn_decls else []
@@ -248,7 +286,7 @@ class AntigravityChatModel(BaseChatModel):
         headers = {
             "Authorization": f"Bearer {creds.token}",
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/cli/1.1.12 (aidev_client; os_type=linux; arch=amd64; cl=962369648; auth_method=consumer)",
+            "User-Agent": "antigravity/cli/1.2.7 (aidev_client; os_type=linux; arch=amd64; cl=962369648; auth_method=consumer)",
             "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
             "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}',
         }

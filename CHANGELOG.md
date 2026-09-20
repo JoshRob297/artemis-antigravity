@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0-antigravity] - 2026-09-20
+
+### Fixed
+- **Strict Tool Schema Sanitization (Fix HTTP 400 `property is not defined`)**: Added recursive `_sanitize_tool_parameters` in `artemis/antigravity/model.py` to validate Pydantic/LangChain tool schemas against Cloud Code Protobuf requirements, purging orphan required keys and eliminating empty required arrays.
+
+### Added
+- **Model Support: `gpt-oss-120b-medium`**: Added backend mapping for Antigravity's open-source 120B model in `_resolve_backend_model`.
+- **Client Signature Parity**: Updated User-Agent to `antigravity/cli/1.2.7 (aidev_client; os_type=linux; arch=amd64; cl=962369648; auth_method=consumer)`.
+
 ## [1.0.0-antigravity] - 2026-09-17
 
 ### Added
