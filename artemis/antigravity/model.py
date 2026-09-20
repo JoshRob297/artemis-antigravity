@@ -1,25 +1,20 @@
 """Custom LangChain Chat Model that routes directly to Google Cloud Code Assist API."""
 
 import json
-import os
 import re
 import uuid
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Sequence
 import httpx
-from google.auth.transport.requests import Request
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
-    AIMessageChunk,
     BaseMessage,
-    ChatMessage,
-    FunctionMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 from artemis.antigravity.accounts import get_account_manager
@@ -30,6 +25,24 @@ from artemis.antigravity.constants import (
 from artemis.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Persistent project cache keyed by account email to prevent redundant loadCodeAssist calls
+_PROJECT_CACHE: dict[str, str] = {}
+
+# Persistent HTTP client with connection pooling and keep-alive
+_HTTP_CLIENT: httpx.Client | None = None
+
+
+def _get_http_client(timeout: float) -> httpx.Client:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.Client(
+            timeout=timeout,
+            limits=httpx.Limits(
+                max_keepalive_connections=20, max_connections=50, keepalive_expiry=60.0
+            ),
+        )
+    return _HTTP_CLIENT
 
 
 def _resolve_backend_model(model_name: str) -> str:
@@ -58,8 +71,6 @@ def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str
         declarations = []
         for gt in genai_tools:
             d = gt.model_dump(mode="json", exclude_none=True)
-            # Normalize top-level key to camelCase (functionDeclarations)
-            # while strictly preserving property names and required fields within schemas.
             if "function_declarations" in d:
                 declarations.append({"functionDeclarations": d["function_declarations"]})
             elif "functionDeclarations" in d:
@@ -189,9 +200,13 @@ class AntigravityChatModel(BaseChatModel):
         """Binds tool declarations to this model instance and returns a configured copy."""
         return self.model_copy(update={"bound_tools": list(tools) if tools else []})
 
-    def _resolve_project(self, client: httpx.Client, headers: dict[str, str]) -> str:
+    def _resolve_project(
+        self, client: httpx.Client, headers: dict[str, str], email: str | None
+    ) -> str:
         if self.project_id:
             return self.project_id
+        if email and email in _PROJECT_CACHE:
+            return _PROJECT_CACHE[email]
         try:
             resp = client.post(
                 f"{ANTIGRAVITY_ENDPOINT_PROD}/v1internal:loadCodeAssist",
@@ -201,10 +216,15 @@ class AntigravityChatModel(BaseChatModel):
             )
             if resp.status_code == 200:
                 p_data = resp.json().get("cloudaicompanionProject")
+                resolved = None
                 if isinstance(p_data, str):
-                    return p_data
+                    resolved = p_data
                 elif isinstance(p_data, dict) and "id" in p_data:
-                    return p_data["id"]
+                    resolved = p_data["id"]
+                if resolved:
+                    if email:
+                        _PROJECT_CACHE[email] = resolved
+                    return resolved
         except (httpx.HTTPError, OSError, ValueError) as e:
             logger.warning(f"Could not resolve managed project ID: {e}")
         return "rising-fact-p41fc"
@@ -221,12 +241,9 @@ class AntigravityChatModel(BaseChatModel):
         if not creds:
             raise ValueError("No Antigravity accounts configured.")
 
-        # Ensure token is valid
-        if not creds.token:
-            creds.refresh(Request())
-
         contents = [_convert_message_to_gemini_dict(m) for m in messages]
         backend_model = _resolve_backend_model(self.model_name)
+        active_email = mgr.get_active_email()
 
         headers = {
             "Authorization": f"Bearer {creds.token}",
@@ -236,97 +253,97 @@ class AntigravityChatModel(BaseChatModel):
             "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}',
         }
 
-        with httpx.Client(timeout=self.timeout) as client:
-            project_id = self._resolve_project(client, headers)
+        client = _get_http_client(timeout=self.timeout)
+        project_id = self._resolve_project(client, headers, active_email)
 
-            request_payload: dict[str, Any] = {
-                "contents": contents,
-                "generationConfig": {
-                    "temperature": self.temperature,
-                    "maxOutputTokens": self.max_output_tokens,
-                },
-                "sessionId": str(uuid.uuid4()),
-            }
+        request_payload: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+            "sessionId": str(uuid.uuid4()),
+        }
 
-            if self.bound_tools:
-                gemini_tools = _convert_tools_to_gemini_declarations(self.bound_tools)
-                if gemini_tools:
-                    request_payload["tools"] = gemini_tools
+        if self.bound_tools:
+            gemini_tools = _convert_tools_to_gemini_declarations(self.bound_tools)
+            if gemini_tools:
+                request_payload["tools"] = gemini_tools
 
-            payload = {
-                "project": project_id,
-                "model": backend_model,
-                "request": request_payload,
-                "requestType": "agent",
-                "userAgent": "antigravity",
-                "requestId": f"agent-{uuid.uuid4()}",
-            }
+        payload = {
+            "project": project_id,
+            "model": backend_model,
+            "request": request_payload,
+            "requestType": "agent",
+            "userAgent": "antigravity",
+            "requestId": f"agent-{uuid.uuid4()}",
+        }
 
-            endpoints = [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_PROD]
-            last_error = None
+        endpoints = [ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_ENDPOINT_PROD]
+        last_error = None
 
-            for attempt in range(mgr.get_account_count() * 2):
-                for endpoint in endpoints:
-                    url = f"{endpoint}/v1internal:streamGenerateContent?alt=sse"
-                    try:
-                        resp = client.post(url, json=payload, headers=headers)
+        for attempt in range(mgr.get_account_count() * 2):
+            for endpoint in endpoints:
+                url = f"{endpoint}/v1internal:streamGenerateContent?alt=sse"
+                try:
+                    resp = client.post(url, json=payload, headers=headers)
 
-                        if resp.status_code == 200:
-                            full_text: list[str] = []
-                            tool_calls: list[dict[str, Any]] = []
+                    if resp.status_code == 200:
+                        full_text: list[str] = []
+                        tool_calls: list[dict[str, Any]] = []
 
-                            for line in resp.text.splitlines():
-                                line = line.strip()
-                                if line.startswith("data: "):
-                                    try:
-                                        data = json.loads(line[6:])
-                                        response_obj = data.get("response", data)
-                                        candidates = response_obj.get("candidates", [])
-                                        if candidates:
-                                            parts = (
-                                                candidates[0].get("content", {}).get("parts", [])
-                                            )
-                                            for p in parts:
-                                                if "text" in p and p["text"]:
-                                                    full_text.append(p["text"])
-                                                elif "functionCall" in p:
-                                                    fc = p["functionCall"]
-                                                    tool_calls.append(
-                                                        {
-                                                            "name": fc.get("name", ""),
-                                                            "args": fc.get("args", {}),
-                                                            "id": fc.get("id")
-                                                            or f"call_{uuid.uuid4().hex[:8]}",
-                                                            "type": "tool_call",
-                                                        }
-                                                    )
-                                    except (json.JSONDecodeError, KeyError, IndexError):
-                                        continue
+                        for line in resp.text.splitlines():
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                try:
+                                    data = json.loads(line[6:])
+                                    response_obj = data.get("response", data)
+                                    candidates = response_obj.get("candidates", [])
+                                    if candidates:
+                                        parts = candidates[0].get("content", {}).get("parts", [])
+                                        for p in parts:
+                                            if "text" in p and p["text"]:
+                                                full_text.append(p["text"])
+                                            elif "functionCall" in p:
+                                                fc = p["functionCall"]
+                                                tool_calls.append(
+                                                    {
+                                                        "name": fc.get("name", ""),
+                                                        "args": fc.get("args", {}),
+                                                        "id": fc.get("id")
+                                                        or f"call_{uuid.uuid4().hex[:8]}",
+                                                        "type": "tool_call",
+                                                    }
+                                                )
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
 
-                            output_text = "".join(full_text)
-                            message = AIMessage(
-                                content=output_text,
-                                tool_calls=tool_calls if tool_calls else [],
+                        output_text = "".join(full_text)
+                        message = AIMessage(
+                            content=output_text,
+                            tool_calls=tool_calls if tool_calls else [],
+                        )
+                        return ChatResult(generations=[ChatGeneration(message=message)])
+
+                    elif resp.status_code in (429, 503):
+                        logger.warning(
+                            f"Quota exceeded on endpoint {endpoint} (HTTP {resp.status_code}). Rotating account..."
+                        )
+                        creds = mgr.rotate_to_next_account()
+                        if creds:
+                            active_email = mgr.get_active_email()
+                            headers["Authorization"] = f"Bearer {creds.token}"
+                            payload["project"] = self._resolve_project(
+                                client, headers, active_email
                             )
-                            return ChatResult(generations=[ChatGeneration(message=message)])
+                        break
+                    else:
+                        last_error = f"HTTP {resp.status_code}: {resp.text}"
+                        logger.warning(f"Endpoint {endpoint} failed with {last_error}")
+                except (httpx.HTTPError, OSError, ValueError) as e:
+                    last_error = str(e)
+                    logger.warning(f"Connection to {endpoint} failed: {e}")
 
-                        elif resp.status_code in (429, 503):
-                            logger.warning(
-                                f"Quota exceeded on endpoint {endpoint} (HTTP {resp.status_code}). Rotating account..."
-                            )
-                            creds = mgr.rotate_to_next_account()
-                            if creds:
-                                creds.refresh(Request())
-                                headers["Authorization"] = f"Bearer {creds.token}"
-                                payload["project"] = self._resolve_project(client, headers)
-                            break
-                        else:
-                            last_error = f"HTTP {resp.status_code}: {resp.text}"
-                            logger.warning(f"Endpoint {endpoint} failed with {last_error}")
-                    except (httpx.HTTPError, OSError, ValueError) as e:
-                        last_error = str(e)
-                        logger.warning(f"Connection to {endpoint} failed: {e}")
-
-            raise RuntimeError(
-                f"All Antigravity accounts/endpoints exhausted. Last error: {last_error}"
-            )
+        raise RuntimeError(
+            f"All Antigravity accounts/endpoints exhausted. Last error: {last_error}"
+        )

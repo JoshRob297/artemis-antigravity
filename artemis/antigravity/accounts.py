@@ -3,8 +3,8 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-import httpx
+from typing import Any
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 from artemis.antigravity.constants import (
@@ -30,6 +30,7 @@ class AntigravityAccountManager:
         self.accounts_path = self._resolve_path(custom_path)
         self.accounts: list[dict[str, Any]] = []
         self.active_index: int = 0
+        self._cached_credentials: dict[str, Credentials] = {}
         self.reload()
 
     def _resolve_path(self, custom_path: str | None) -> Path:
@@ -66,6 +67,7 @@ class AntigravityAccountManager:
             if self.accounts and self.active_index >= len(self.accounts):
                 self.active_index = 0
 
+            self._cached_credentials.clear()
             logger.info(
                 f"Loaded {len(self.accounts)} Antigravity accounts from {self.accounts_path}"
             )
@@ -82,15 +84,27 @@ class AntigravityAccountManager:
         return self.accounts[self.active_index].get("email")
 
     def get_credentials(self) -> Credentials | None:
-        """Returns a valid Google OAuth Credentials object for the active account."""
+        """Returns a valid, cached Google OAuth Credentials object for the active account."""
         if not self.accounts:
             return None
 
         account = self.accounts[self.active_index]
+        email = account.get("email")
         refresh_token = account.get("refreshToken")
         if not refresh_token:
-            logger.error(f"Active account {account.get('email')} is missing refreshToken.")
+            logger.error(f"Active account {email} is missing refreshToken.")
             return None
+
+        if email in self._cached_credentials:
+            creds = self._cached_credentials[email]
+            if creds.valid:
+                return creds
+            if creds.expired or not creds.token:
+                try:
+                    creds.refresh(Request())
+                    return creds
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Failed to refresh cached token for {email}: {e}")
 
         creds = Credentials(
             token=None,
@@ -100,6 +114,14 @@ class AntigravityAccountManager:
             client_secret=ANTIGRAVITY_CLIENT_SECRET,
             scopes=ANTIGRAVITY_SCOPES,
         )
+        try:
+            creds.refresh(Request())
+            if email:
+                self._cached_credentials[email] = creds
+        except (OSError, ValueError) as e:
+            logger.error(f"Initial refresh for {email} failed: {e}")
+            return None
+
         return creds
 
     def rotate_to_next_account(self) -> Credentials | None:
