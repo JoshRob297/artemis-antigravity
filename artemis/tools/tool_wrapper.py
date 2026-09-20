@@ -182,7 +182,7 @@ def get_tool_result_content(result: Any) -> Any:
 ImageCarrier = Literal["tool", "human"]
 
 #: Providers whose tool-result messages may carry image parts directly.
-_TOOL_IMAGE_PROVIDERS = frozenset({"google", "anthropic"})
+_TOOL_IMAGE_PROVIDERS = frozenset({"google", "anthropic", "antigravity"})
 
 _STEP_RE = re.compile(r"\bstep\s+(\d+)", re.IGNORECASE)
 

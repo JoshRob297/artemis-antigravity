@@ -4,7 +4,7 @@ import json
 import os
 import re
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 import httpx
 from google.auth.transport.requests import Request
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -47,19 +47,105 @@ def _resolve_backend_model(model_name: str) -> str:
     return "gemini-3.8-flash-low"
 
 
+def _to_camel_case(s: str) -> str:
+    parts = s.split("_")
+    return parts[0] + "".join(p.title() for p in parts[1:])
+
+
+def _camel_dict_keys(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {_to_camel_case(k): _camel_dict_keys(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_camel_dict_keys(i) for i in obj]
+    return obj
+
+
+def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str, Any]]:
+    """Converts LangChain tool declarations / schemas into Cloud Code / Gemini format."""
+    if not tools:
+        return []
+    try:
+        from langchain_google_genai.chat_models import convert_to_genai_function_declarations
+
+        genai_tools = convert_to_genai_function_declarations(tools)
+        declarations = []
+        for gt in genai_tools:
+            d = gt.model_dump(mode="json", exclude_none=True)
+            declarations.append(_camel_dict_keys(d))
+        return declarations
+    except (ImportError, AttributeError, ValueError, TypeError) as e:
+        logger.warning(f"langchain_google_genai conversion failed ({e}); using manual fallback")
+        fn_decls = []
+        for t in tools:
+            name = getattr(t, "name", None) or (
+                t.get("function", {}).get("name") if isinstance(t, dict) else None
+            )
+            desc = getattr(t, "description", None) or (
+                t.get("function", {}).get("description") if isinstance(t, dict) else None
+            )
+            params = getattr(t, "parameters", None) or (
+                t.get("function", {}).get("parameters") if isinstance(t, dict) else {}
+            )
+            if name:
+                fn_decls.append(
+                    {
+                        "name": name,
+                        "description": desc or "",
+                        "parameters": params or {"type": "object", "properties": {}},
+                    }
+                )
+        return [{"functionDeclarations": fn_decls}] if fn_decls else []
+
+
 def _convert_message_to_gemini_dict(message: BaseMessage) -> dict[str, Any]:
+    parts = []
+
+    if isinstance(message, ToolMessage):
+        role = "user"
+        content_val = message.content
+        if isinstance(content_val, str):
+            try:
+                parsed_json = json.loads(content_val)
+                response_body = (
+                    {"output": parsed_json} if not isinstance(parsed_json, dict) else parsed_json
+                )
+            except (json.JSONDecodeError, ValueError):
+                response_body = {"output": content_val}
+        else:
+            response_body = {"output": content_val}
+
+        parts.append(
+            {
+                "functionResponse": {
+                    "name": message.name or "tool_result",
+                    "response": response_body,
+                }
+            }
+        )
+        return {"role": role, "parts": parts}
+
     if isinstance(message, HumanMessage):
         role = "user"
     elif isinstance(message, AIMessage):
         role = "model"
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                parts.append(
+                    {
+                        "functionCall": {
+                            "name": tc.get("name", ""),
+                            "args": tc.get("args", {}),
+                        }
+                    }
+                )
     elif isinstance(message, SystemMessage):
         role = "user"
     else:
         role = "user"
 
-    parts = []
     if isinstance(message.content, str):
-        parts.append({"text": message.content})
+        if message.content:
+            parts.append({"text": message.content})
     elif isinstance(message.content, list):
         for item in message.content:
             if isinstance(item, str):
@@ -76,8 +162,11 @@ def _convert_message_to_gemini_dict(message: BaseMessage) -> dict[str, Any]:
                             parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
                     else:
                         parts.append({"text": f"[Image: {url}]"})
-    else:
+    elif message.content:
         parts.append({"text": str(message.content)})
+
+    if not parts:
+        parts.append({"text": ""})
 
     return {"role": role, "parts": parts}
 
@@ -90,10 +179,21 @@ class AntigravityChatModel(BaseChatModel):
     max_output_tokens: int | None = Field(default=8192)
     timeout: float = Field(default=60.0)
     project_id: str | None = Field(default=None)
+    bound_tools: list[Any] = Field(default_factory=list, exclude=True)
 
     @property
     def _llm_type(self) -> str:
         return "antigravity-chat-model"
+
+    def bind_tools(
+        self,
+        tools: Sequence[Any],
+        *,
+        tool_choice: Any | None = None,
+        **kwargs: Any,
+    ) -> "AntigravityChatModel":
+        """Binds tool declarations to this model instance and returns a configured copy."""
+        return self.model_copy(update={"bound_tools": list(tools) if tools else []})
 
     def _resolve_project(self, client: httpx.Client, headers: dict[str, str]) -> str:
         if self.project_id:
@@ -145,7 +245,7 @@ class AntigravityChatModel(BaseChatModel):
         with httpx.Client(timeout=self.timeout) as client:
             project_id = self._resolve_project(client, headers)
 
-            request_payload = {
+            request_payload: dict[str, Any] = {
                 "contents": contents,
                 "generationConfig": {
                     "temperature": self.temperature,
@@ -153,6 +253,11 @@ class AntigravityChatModel(BaseChatModel):
                 },
                 "sessionId": str(uuid.uuid4()),
             }
+
+            if self.bound_tools:
+                gemini_tools = _convert_tools_to_gemini_declarations(self.bound_tools)
+                if gemini_tools:
+                    request_payload["tools"] = gemini_tools
 
             payload = {
                 "project": project_id,
@@ -173,8 +278,9 @@ class AntigravityChatModel(BaseChatModel):
                         resp = client.post(url, json=payload, headers=headers)
 
                         if resp.status_code == 200:
-                            # Parse SSE events
-                            full_text = []
+                            full_text: list[str] = []
+                            tool_calls: list[dict[str, Any]] = []
+
                             for line in resp.text.splitlines():
                                 line = line.strip()
                                 if line.startswith("data: "):
@@ -187,13 +293,27 @@ class AntigravityChatModel(BaseChatModel):
                                                 candidates[0].get("content", {}).get("parts", [])
                                             )
                                             for p in parts:
-                                                if "text" in p:
+                                                if "text" in p and p["text"]:
                                                     full_text.append(p["text"])
+                                                elif "functionCall" in p:
+                                                    fc = p["functionCall"]
+                                                    tool_calls.append(
+                                                        {
+                                                            "name": fc.get("name", ""),
+                                                            "args": fc.get("args", {}),
+                                                            "id": fc.get("id")
+                                                            or f"call_{uuid.uuid4().hex[:8]}",
+                                                            "type": "tool_call",
+                                                        }
+                                                    )
                                     except (json.JSONDecodeError, KeyError, IndexError):
                                         continue
 
                             output_text = "".join(full_text)
-                            message = AIMessage(content=output_text)
+                            message = AIMessage(
+                                content=output_text,
+                                tool_calls=tool_calls if tool_calls else [],
+                            )
                             return ChatResult(generations=[ChatGeneration(message=message)])
 
                         elif resp.status_code in (429, 503):
@@ -213,6 +333,6 @@ class AntigravityChatModel(BaseChatModel):
                         last_error = str(e)
                         logger.warning(f"Connection to {endpoint} failed: {e}")
 
-        raise RuntimeError(
-            f"All Antigravity accounts/endpoints exhausted. Last error: {last_error}"
-        )
+            raise RuntimeError(
+                f"All Antigravity accounts/endpoints exhausted. Last error: {last_error}"
+            )
