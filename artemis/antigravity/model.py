@@ -47,19 +47,6 @@ def _resolve_backend_model(model_name: str) -> str:
     return "gemini-3.8-flash-low"
 
 
-def _to_camel_case(s: str) -> str:
-    parts = s.split("_")
-    return parts[0] + "".join(p.title() for p in parts[1:])
-
-
-def _camel_dict_keys(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {_to_camel_case(k): _camel_dict_keys(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_camel_dict_keys(i) for i in obj]
-    return obj
-
-
 def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str, Any]]:
     """Converts LangChain tool declarations / schemas into Cloud Code / Gemini format."""
     if not tools:
@@ -71,7 +58,14 @@ def _convert_tools_to_gemini_declarations(tools: Sequence[Any]) -> list[dict[str
         declarations = []
         for gt in genai_tools:
             d = gt.model_dump(mode="json", exclude_none=True)
-            declarations.append(_camel_dict_keys(d))
+            # Normalize top-level key to camelCase (functionDeclarations)
+            # while strictly preserving property names and required fields within schemas.
+            if "function_declarations" in d:
+                declarations.append({"functionDeclarations": d["function_declarations"]})
+            elif "functionDeclarations" in d:
+                declarations.append({"functionDeclarations": d["functionDeclarations"]})
+            else:
+                declarations.append(d)
         return declarations
     except (ImportError, AttributeError, ValueError, TypeError) as e:
         logger.warning(f"langchain_google_genai conversion failed ({e}); using manual fallback")
