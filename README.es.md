@@ -179,14 +179,6 @@ Agregar a la configuración MCP (ej. `opencode.json`, Claude Code o Cursor):
 
 ---
 
-## Seguridad y OPSEC
-
-- Credenciales (`accounts.json`, `.env`, tokens) estrictamente excluidas del control de versiones mediante `.gitignore`.
-- Los tokens de acceso se renuevan en memoria de forma dinámica; nunca se imprimen refresh tokens en logs de ejecución ni salidas estándar.
-- Cumplimiento estricto de la directiva de Cero Emojis en código, commits y documentación técnica.
-
----
-
 ## Licencia y Atribución
 
 Este proyecto está bajo la licencia [Apache License 2.0](LICENSE).  
